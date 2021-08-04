@@ -15,9 +15,13 @@ from io import BytesIO
 from urllib.parse import urlparse
 from urllib.request import urlretrieve
 
+import cv2
 import flickrapi
+import imagehash
+import numpy as np
 import requests
 from PIL import Image
+from tqdm import tqdm
 
 # sources column format
 SEARCH_TERM = 0
@@ -44,16 +48,17 @@ Config:
 id = [your api id]
 secret = [your secret/password]
 [Download]
-path = iamges/saved/to/path
+path = images/saved/to/path
 search = christmas decorations
 prefix = christmas               # prefix added to images
 update_minutes = 1
 license = 0,1,2,3,4,5,6,7,8,9,10
-max_download = 100000
+image_count = 100000
 sources_file = sources.csv       # save urls, prevent duplicates
 image_size = l                   # flickr image size search restrictions, see below
 orientation = landscape          # [optional] flickr orientation (landscape/portrait)
 tag_mode = all                   # [optional] flickr tag mode (all/any)
+start_page = 1                   # [optional] starting page, defaults to automatic paging
 [Process]
 process = True
 crop_square = True
@@ -62,6 +67,9 @@ min_height = 256
 scale_width = 256
 scale_height = 256
 image_format = jpg
+[ImageHash]
+algorithm = crop_resistant
+threshold = 3                   # [default : 4] percentage of difference (<1.0 or > 1)
 
 
 Photo Source URLs
@@ -112,7 +120,7 @@ class FlickrImageDownload:
         self.config_prefix = self.config['Download']['prefix']
         self.config_search = self.config['Download']['search']
         self.config_update_minutes = int(self.config['Download']['update_minutes'])
-        self.config_max_download_count = int(self.config['Download']['max_download'])
+        self.config_image_count = int(self.config['Download']['image_count'])
         self.config_license_allowed = [int(e) if e.isdigit() else e 
             for e in self.config['Download']['license'].split(',')]
         self.config_format = self.config['Process']['image_format']
@@ -128,10 +136,12 @@ class FlickrImageDownload:
         self.config_flickr_size = self.config['Download'].get('image_size', 'c')
         self.config_sources_file = self.config['Download'].get('sources_file', None)
         self.config_flickr_orientation = self.config['Download'].get('orientation', None)
-        
+        self.config_start_page = self.config['Download'].get('start_page', None)
+        if self.config_start_page is not None:
+            self.config_start_page = int(self.config_start_page)
+
         # image hash config
         if self.config.has_section('ImageHash'):
-            import imagehash
             hashmethod = self.config['ImageHash'].get('algorithm', 'ahash')
             if hashmethod == 'ahash' or hashmethod == 'average':
                 hashfunc = imagehash.average_hash
@@ -148,6 +158,9 @@ class FlickrImageDownload:
             elif hashmethod == 'crop-resistant' or hashmethod == 'crop_resistant':
                 hashfunc = imagehash.crop_resistant_hash
             self.config_hash_func = hashfunc
+            self.config_hash_threshold = float(self.config['ImageHash'].get('threshold', 4))
+            if self.config_hash_threshold >= 1.0:
+                self.config_hash_threshold /= 100.0
         else:
             self.config_hash_func = None
 
@@ -162,23 +175,28 @@ class FlickrImageDownload:
     
 
     def reset_counts(self):
-        self.download_count = 0
         self.start_time = time.time()
-        self.last_update = 0
-        self.download_count = 0
-        self.error_count = 0
+        self.count = 0
         self.cached = 0
+        self.download_count = 0
+        self.last_update = 0
+        self.error_count = 0
         self.sources = []
         self.hashes = set()
 
         
     def load_image(self, url):
+        """Returns a PIL image and and openCV image"""
         try:
             response = requests.get(url)
-            h = sha256(response.content).hexdigest()
-            img = Image.open(BytesIO(response.content))
+            img = Image.open(BytesIO(response.content)).convert('RGB')
             img.load()
-            return img, h
+            try:
+                cv_img = cv2.imdecode(np.asarray(bytearray(response.content)), 1)
+            except Exception as e:
+                print("Failed to decode cv image: ", e)
+                return img, None
+            return img, cv_img
         except KeyboardInterrupt:
             logging.info("Keyboard interrupt, stopping")
             sys.exit(0)
@@ -188,18 +206,19 @@ class FlickrImageDownload:
         
 
     def obtain_photo(self, photo):
+        """Returns a PIL image and and openCV image"""
         url = photo.get('url_c')
         license = photo.get('license')
 
         if int(license) in self.config_license_allowed and url:
-            image, h = self.load_image(url)
+            image, cv_image = self.load_image(url) 
             
             if image:
-                return image
+                return image, cv_image
             else:
                 self.error_count += 1
                 
-        return None
+        return None, None
     
     def check_to_keep_photo(self, url, image):
         if self.config_hash_func:
@@ -207,7 +226,8 @@ class FlickrImageDownload:
         else:
             h = sha256(image.tobytes()).hexdigest()
 
-        p = os.path.join(self.config_path, f"{self.config_prefix}-{h}.{self.config_format}")
+        file_path = f"{self.config_prefix}-{h}.{self.config_format}"
+        p = os.path.join(self.config_path, file_path)
         exists = os.path.exists(p)
 
         # see if hash exists in sources already
@@ -220,8 +240,22 @@ class FlickrImageDownload:
                 logging.debug(f"Image already retrieved, but rejected: {url}")
                 return None
 
+        # check for closeness of hash match
+        if self.config_hash_func is not None:
+            closest_match = 1000000
+            bits_threshold = max(1, round(float(len(h)) * self.config_hash_threshold))
+            for other_hash in self.hashes:
+                diff = h - other_hash
+                if diff < closest_match:
+                    closest_match = diff
+                if diff <= bits_threshold:
+                    logging.debug(f"Image too similar to existing (diff: {diff} <= {bits_threshold} ({self.config_hash_threshold}%)): {url}")
+                    return None
+            closest_percent = round(float(closest_match) / float(len(h)) * 100.0, 1)
+            logging.info(f"Closest match: {closest_match} ({closest_percent}%)")
+
         if not exists:
-            self.sources.append([self.config_search, url, p, h])
+            self.sources.append([self.config_search, url, file_path, h])
             self.hashes.add(h)
             self.download_count += 1
             logging.debug(f"Downloaded: {url} to {p}")
@@ -265,26 +299,32 @@ class FlickrImageDownload:
 
 
     def crop(self, image, edge, percent):
-        (left, top, right, bottom) = (0, 0, image.width, image.height)
+        w, h = image.width, image.height
+        box =  (0, 0, w, h)
         if edge == '':
             edge = 'a'
         edge = edge.lower()[0]
+
+        if percent >= 1.0:
+            percent /= 100.0
+
         if edge == 't':
-            image = image.crop(left, math.floor(top * percent), right, bottom)
+            box = (0, math.floor(h * percent), w, h)
         if edge == 'b':
-            image = image.crop(left, top, right, math.floor(bottom * (1.0 - percent)))
+            box = (0, 0, w, math.floor(h * (1.0 - percent)))
         if edge == 'l':
-            image = image.crop(math.floor(left * percent), top, right, bottom)
+            box =(math.floor(w * percent), 0, w, h)
         if edge == 'r':
-            image = image.crop(left, top, math.floor(right * (1.0 - percent)), bottom)
+            box = (0, 0, math.floor(w * (1.0 - percent)), h)
         if edge == 'a':
-            image = image.crop(
-                math.floor(left * percent),
-                math.floor(top * percent),
-                math.floor(right * (1.0 - percent)),
-                math.floor(bottom * (1.0 - percent))
+            box = (
+                math.floor(w * percent),
+                math.floor(h * percent),
+                math.floor(w * (1.0 - percent)),
+                math.floor(h * (1.0 - percent))
             )
-        return image
+        
+        return image.crop(box)
 
 
     def track_progress(self):
@@ -294,7 +334,7 @@ class FlickrImageDownload:
             logging.info(f"Update for {elapsed_min}: images={self.download_count:,}; errors={self.error_count:,}; cached={self.cached:,}")
             self.last_update = elapsed_min
 
-        if self.download_count > self.config_max_download_count:
+        if self.count >= self.config_image_count:
             logging.info("Reached max download count")
             return True
         
@@ -318,8 +358,18 @@ class FlickrImageDownload:
                 with open(filename) as f:
                     reader = csv.reader(f)
                     self.sources = [row for row in reader] 
-                    self.sources.pop(0) # remove header
-                    self.hashes.update([row[HASH] for row in self.sources])
+                self.sources.pop(0) # remove header
+                if self.config_hash_func is not None:
+                    self.hashes.update([imagehash.hex_to_hash(row[HASH]) for row in self.sources])
+                # find existing count of images
+                # files in sources with existing files
+                for row in self.sources:
+                    if row[PATH] != '':
+                        if os.path.exists( os.path.join(self.config_path, row[PATH]) ):
+                            self.count += 1
+                        else:
+                            logging.debug(f"Image path doesn't exist: {row[PATH]}")
+                            row[PATH] = ''  # remove it
 
     def run(self):
         logging.info("Starting...")
@@ -330,62 +380,161 @@ class FlickrImageDownload:
         self.load_sources()
         ignore_ids = [url_to_id(url) for search, url, f, hash in self.sources]
 
+        if self.count >= self.config_image_count:
+            logging.info(f"Already obtained {self.config_image_count} images in {self.config_path}")
+            return
+
         # get flickr urls
         flickr_url = f"url_{self.config_flickr_size}"
         
+        # paging
+        per_page = 50
+        if self.config_start_page is None:
+            page_num = 0
+            if self.count > 0:
+                page_num = math.floor(self.count / per_page)
+        else:
+            page_num = self.config_start_page
+
         params = dict(
             text=self.config_search,
             #tag_mode=self.config_flickr_tag_mode,
             #tags=self.config_search,
             extras=f"{flickr_url},license",
-            per_page=100,           
+            per_page=per_page,           
             sort='relevance',
             content_type=1,   # photos only
             orientation=self.config_flickr_orientation,
             media='photos',
+            page=page_num
         )
         print(params)
         photos = self.flickr.walk(**params)
 
-        count = 0
+        # opencv image window
+        cv2.namedWindow('image')
+        global posList
+        global drawing
+        posList = []
+        drawing = False
+
+        def getMouseHandler(img):
+            def onMouse(event, x, y, flags, param):
+                global posList, drawing
+                if event == cv2.EVENT_LBUTTONDOWN:
+                    posList = [(x,y)]
+                    drawing = True
+                    print("start drwawing", x, y)
+                elif event == cv2.EVENT_MOUSEMOVE:
+                    if drawing == True:
+                        cv2.rectangle(img, pt1=posList[0], pt2=(x, y), color=(255,0,0),thickness=1)
+                        print(x, y)
+                elif event == cv2.EVENT_LBUTTONUP:
+                    posList.append((x, y))
+                    cv2.rectangle(img, pt1=posList[0], pt2=(x, y), color=(0,0,0),thickness=1)
+                    drawing = False
+                    print("stop drawing", x, y)
+            return onMouse
+
+        images_bar = tqdm(desc="Images", unit="", initial=self.count, total=self.config_image_count)
+        urls_bar = tqdm(photos, desc="Urls processed", unit="")
+
+        # input closure
+        def get_input(text):
+            tqdm.write(text)
+            urls_bar.clear()
+            images_bar.clear()
+            return input()
+
         quit = False
-        for photo in photos:
+        for photo in urls_bar:
             try:
                 url = photo.get(flickr_url)
-                print(f"Retrieved url: {url}")
+                logging.debug(f"Retrieved url: {url}")
                 if url == '' or url == None:
-                    print("Url could not be fetched")
+                    logging.debug("Url could not be fetched")
+                    tqdm.write("Url could not be fetched")
+                    time.sleep(0.5) # slow down
+                    pass
                 else:
                     photo_id = url_to_id(url)
                     if photo_id not in ignore_ids:
-                        img = self.obtain_photo(photo)
+                        img, cv_img = self.obtain_photo(photo)
                         if img: 
                             path = self.check_to_keep_photo(url, img)
                             if path:
-                                count += 1
+                                tqdm.write("Found new image")
                                 img = self.process_image(img, path)
                                 while True:
-                                    img.show()
-                                    keep = input("Keep image? Y/n/[c]rop)/[q]uit: ")
-                                    keep = keep.lower()
-                                    if keep.startswith('c'):
-                                        crop = input("Crop [t]op/[b]ottom/[a]ll: ")
-                                        percent = input("Crop percent (0-1.0): ")
-                                        img = self.crop(crop, float(percent), img)
-                                    if keep.startswith('n'):
-                                        print("Rejected image")
+                                    tqdm.write("Keep image? Y/n/[c]rop)/[q]uit: ")
+                                    if cv_img is not None:
+                                        tqdm.write("Select image window before keyboard input, left click drag to crop")
+                                        posList = []
+                                        def onMouse(event, x, y, flags, param):
+                                            global posList
+                                            if event == cv2.EVENT_LBUTTONDOWN:
+                                                posList = [(x,y)]
+                                            elif event == cv2.EVENT_LBUTTONUP:
+                                                posList.append((x, y))
+                                        cv2.setMouseCallback('image', onMouse)
+                                       
+                                        cv2.imshow('image', cv_img)
+                                        k = cv2.waitKey(0)
+                                    else:
+                                        img.show()
+                                        k = get_input()
+
+                                    if isinstance(k, int):
+                                        k = chr(k)
+                                    if isinstance(k, str):
+                                        if k.strip() == '' or k == "\r" or k == "\n":
+                                            k = 'y'
+                                        k = k.lower()[0]
+                                    else:
+                                        logging.error("Invalid input")
+                                        sys.exit(1)
+
+                                    tqdm.write(f"Input: {k}")
+                                    if k == 'c':
+                                        if len(posList) == 2:
+                                            box = (
+                                                posList[0][0],
+                                                posList[0][1],
+                                                posList[1][0],
+                                                posList[1][1],
+                                            )
+                                            img = img.crop(box)
+                                        else:
+                                            crop = get_input("Crop [t]op/[b]ottom/[l]eft/[r]ight/[a]ll: ")
+                                            percent = get_input("Crop percent (0-1.0): ")
+                                            img = self.crop(img, crop, float(percent))
+                                        cv_img = cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
+                                    elif k == 'n':
+                                        tqdm.write("Rejected image")
+                                        # remove filename from sources
+                                        self.sources[-1][PATH] = ""
                                         break
-                                    if keep.startswith('q'):
+                                    elif k == 'q':
                                         quit = True
                                         break
                                     else:
                                         img.save(path)
+                                        self.count += 1
+                                        images_bar.update(1)
+                                        images_bar.refresh()
+                                        urls_bar.refresh()
                                         break
-            except:
-                print("Url fetch failed")
+            except Exception as e:
+                logging.warn("Url fetch failed: ", e)
+                tqdm.write("Url fetch failed")
+                time.sleep(0.5) # slow down
             if self.track_progress() or quit:
                 break
         
+        urls_bar.close()
+        images_bar.close()
+        cv2.destroyAllWindows()
+
         self.write_sources()
         elapsed_time = time.time() - self.start_time
         logging.info("Complete, elapsed time: {}".format(hms_string(elapsed_time)))

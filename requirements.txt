@@ -1,0 +1,3 @@
+flickrapi 
+imagehash
+tqdm
